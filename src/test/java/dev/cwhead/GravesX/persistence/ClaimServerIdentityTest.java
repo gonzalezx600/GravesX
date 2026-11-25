@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ClaimServerIdentityTest {
@@ -50,7 +51,13 @@ class ClaimServerIdentityTest {
     }
 
     @Test
-    void concurrentFirstLoadReturnsOneIdentity() throws Exception {
+    void windowsSkipsUnsupportedDirectoryFsync() {
+        assertDoesNotThrow(() -> ClaimServerIdentity.forceDirectoryForPlatform(
+                temporaryDirectory.resolve("missing-directory"), "Windows 11"));
+    }
+
+    @Test
+    void concurrentCreationReturnsOneStableIdentity() throws Exception {
         Path file = temporaryDirectory.resolve("claim-server-id");
         int contenders = 8;
         var executor = Executors.newFixedThreadPool(contenders);

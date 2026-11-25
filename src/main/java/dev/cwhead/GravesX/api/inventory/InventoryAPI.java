@@ -40,6 +40,7 @@ public class InventoryAPI {
      * @param player    The player to be equipped with armor.
      */
     public void equipArmor(@NotNull Inventory inventory, @NotNull Player player) {
+        refuseGravePayloadMutation(inventory);
         InventoryUtil.equipArmor(inventory, player);
         saveGraveInventory(inventory);
     }
@@ -51,6 +52,7 @@ public class InventoryAPI {
      * @param player    The player to be equipped with items.
      */
     public void equipItems(@NotNull Inventory inventory, @NotNull Player player) {
+        refuseGravePayloadMutation(inventory);
         InventoryUtil.equipItems(inventory, player);
         saveGraveInventory(inventory);
     }
@@ -76,6 +78,13 @@ public class InventoryAPI {
     public Inventory stringToInventory(@NotNull InventoryHolder inventoryHolder, @NotNull String string, @NotNull String title) {
         return InventoryUtil.stringToInventory(inventoryHolder, string, title, plugin);
     }
+    private void refuseGravePayloadMutation(Inventory inventory) {
+        if (inventory.getHolder() instanceof Grave grave) {
+            throw new IllegalStateException("Direct grave inventory transfer is disabled until token-authorized migration: "
+                    + grave.getUUID());
+        }
+    }
+
     private void saveGraveInventory(Inventory inventory) {
         if (inventory.getHolder() instanceof Grave grave) {
             if (!plugin.getDataManager().saveGrave(grave)) {

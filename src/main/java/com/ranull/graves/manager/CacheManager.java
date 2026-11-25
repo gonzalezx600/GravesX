@@ -82,6 +82,13 @@ public class CacheManager {
     /**
      * Writes a changed grave to the selected backend without retaining it in RAM.
      */
+    public void saveGraveCacheOnly(Grave grave) {
+        if (grave == null || database != null) return;
+        if (graveMap instanceof CacheMap<UUID, Grave> cached) {
+            cached.saveExisting(grave.getUUID(), grave);
+        }
+    }
+
     public void saveGrave(Grave grave) {
         if (grave == null) return;
         if (database != null) {

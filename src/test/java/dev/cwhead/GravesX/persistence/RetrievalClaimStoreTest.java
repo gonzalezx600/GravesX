@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RetrievalClaimStoreTest {
@@ -36,13 +37,27 @@ class RetrievalClaimStoreTest {
 
         try (Connection connection = dataSource.getConnection();
              Statement statement = connection.createStatement()) {
-            statement.execute("CREATE TABLE graves_grave (uuid VARCHAR(36) PRIMARY KEY, inventory CLOB, experience INT)");
+            statement.execute("CREATE TABLE graves_grave (uuid VARCHAR(36) PRIMARY KEY, inventory CLOB, equipment CLOB, experience INT, protection INT, provider_id VARCHAR(255))");
         }
         store.createTable();
     }
 
     @Test
-    void onlyOneConcurrentAcquireWins() throws Exception {
+    void acquisitionReturnsAuthoritativePayloadFromClaimTransaction() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        insertGrave(graveId, "sql-items", 17);
+
+        RetrievalClaimStore.Acquired acquired = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(graveId, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.BREAK_DROP));
+
+        assertEquals("sql-items", acquired.payload().inventory());
+        assertEquals(17, acquired.payload().experience());
+    }
+
+    @Test
+    void exactlyOneConcurrentClaimWins() throws Exception {
         UUID graveId = UUID.randomUUID();
         try (Connection connection = dataSource.getConnection();
              var insert = connection.prepareStatement(
@@ -246,7 +261,7 @@ class RetrievalClaimStoreTest {
         UUID graveId = UUID.randomUUID();
         try (Connection connection = caseInsensitive.getConnection();
              Statement statement = connection.createStatement()) {
-            statement.execute("CREATE TABLE graves_grave (uuid VARCHAR(36) PRIMARY KEY, inventory CLOB, experience INT)");
+            statement.execute("CREATE TABLE graves_grave (uuid VARCHAR(36) PRIMARY KEY, inventory CLOB, equipment CLOB, experience INT, protection INT, provider_id VARCHAR(255))");
         }
         caseStore.createTable();
         try (Connection connection = caseInsensitive.getConnection();
@@ -420,6 +435,266 @@ class RetrievalClaimStoreTest {
     private RetrievalClaimStore.Claim withWrongToken(RetrievalClaimStore.Claim claim) {
         return new RetrievalClaimStore.Claim(claim.graveUuid(), UUID.randomUUID(),
                 claim.claimantUuid(), claim.serverId(), claim.operation());
+    }
+
+    @Test
+    void availablePayloadUpdateIsRejectedBeforeTouchingAnActiveGrave() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        insertGrave(graveId, "before", 9);
+        RetrievalClaimStore.Acquired acquired = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(graveId, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.INVENTORY_OPEN));
+
+        try (Connection blocker = dataSource.getConnection();
+             var lock = blocker.prepareStatement(
+                     "UPDATE graves_grave SET inventory = inventory WHERE uuid = ?")) {
+            blocker.setAutoCommit(false);
+            lock.setString(1, graveId.toString());
+            assertEquals(1, lock.executeUpdate());
+
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<Boolean> rejected = executor.submit(() ->
+                        store.updateAvailableInventory(graveId, "forged", 0));
+                assertFalse(rejected.get(1, TimeUnit.SECONDS));
+            } finally {
+                executor.shutdownNow();
+                blocker.rollback();
+            }
+        }
+
+        assertTrue(store.commitInventory(acquired.claim(), "claimed", 0));
+        assertEquals("claimed", readInventory(graveId));
+    }
+
+    @Test
+    void availablePayloadUpdateSucceedsOnlyWithoutAnActiveClaim() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        insertGrave(graveId, "before", 9);
+
+        assertTrue(store.updateAvailableInventory(graveId, "after", 4));
+        assertEquals("after", readInventory(graveId));
+
+        RetrievalClaimStore.Acquired acquired = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(graveId, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.INVENTORY_OPEN));
+        assertFalse(store.updateAvailableInventory(graveId, "blocked", 1));
+        assertTrue(store.quarantine(acquired.claim(), "ambiguous"));
+        assertFalse(store.updateAvailableInventory(graveId, "blocked-again", 2));
+        assertEquals("after", readInventory(graveId));
+    }
+
+    @Test
+    void availableDeletionCreatesTombstoneAndRejectsActiveOrQuarantinedClaims() throws Exception {
+        UUID available = UUID.randomUUID();
+        insertGrave(available, "items", 1);
+        assertTrue(store.deleteAvailable(available));
+        assertGraveCountAndState(available, 0, "DELETED");
+
+        UUID active = UUID.randomUUID();
+        insertGrave(active, "items", 1);
+        RetrievalClaimStore.Acquired claim = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(active, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.DELETE));
+        assertFalse(store.deleteAvailable(active));
+        assertTrue(store.quarantine(claim.claim(), "ambiguous"));
+        assertFalse(store.deleteAvailable(active));
+        assertGraveCountAndState(active, 1, "QUARANTINED");
+    }
+
+    @Test
+    void allowlistedColumnUpdateRequiresAvailableState() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        insertGrave(graveId, "items", 1);
+
+        assertTrue(store.updateAvailableColumn(graveId, "protection", 1));
+        assertEquals(1, readIntColumn(graveId, "protection"));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.updateAvailableColumn(graveId, "uuid = NULL WHERE 1=1 --", 0));
+
+        RetrievalClaimStore.Acquired acquired = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(graveId, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.ADDON_MUTATION));
+        assertFalse(store.updateAvailableColumn(graveId, "protection", 0));
+        assertEquals(1, readIntColumn(graveId, "protection"));
+        assertTrue(store.quarantine(acquired.claim(), "ambiguous"));
+        assertFalse(store.updateAvailableColumn(graveId, "provider_id", "provider"));
+    }
+
+    @Test
+    void arbitraryFullRowMutationRunsOnlyInsideAvailableClaimTransaction() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        insertGrave(graveId, "before", 3);
+
+        assertTrue(store.mutateAvailable(graveId, connection -> {
+            try (var statement = connection.prepareStatement(
+                    "UPDATE graves_grave SET inventory = ?, experience = ? WHERE uuid = ?")) {
+                statement.setString(1, "after");
+                statement.setInt(2, 2);
+                statement.setString(3, graveId.toString());
+                return statement.executeUpdate() == 1;
+            }
+        }));
+        assertEquals("after", readInventory(graveId));
+
+        RetrievalClaimStore.Acquired acquired = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(graveId, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.ADDON_MUTATION));
+        assertFalse(store.mutateAvailable(graveId, connection -> {
+            throw new AssertionError("mutation callback must not run while claim is active");
+        }));
+        assertTrue(store.quarantine(acquired.claim(), "ambiguous"));
+        assertFalse(store.mutateAvailable(graveId, connection -> true));
+    }
+
+    @Test
+    void creationAtomicallyCreatesAvailableClaimAndRejectsTombstoneReuse() throws Exception {
+        UUID graveId = UUID.randomUUID();
+        assertTrue(store.createAvailable(graveId, connection -> {
+            try (var statement = connection.prepareStatement(
+                    "INSERT INTO graves_grave (uuid, inventory, experience) VALUES (?, ?, ?)")) {
+                statement.setString(1, graveId.toString());
+                statement.setString(2, "items");
+                statement.setInt(3, 5);
+                return statement.executeUpdate() == 1;
+            }
+        }));
+        assertGraveCountAndState(graveId, 1, "AVAILABLE");
+        assertTrue(store.deleteAvailable(graveId));
+        assertFalse(store.createAvailable(graveId, connection -> {
+            throw new AssertionError("tombstoned UUID must reject creation before payload insert");
+        }));
+        assertGraveCountAndState(graveId, 0, "DELETED");
+    }
+
+    @Test
+    void backfillCreatesOnlyMissingAvailableRows() throws Exception {
+        UUID legacy = UUID.randomUUID();
+        insertGrave(legacy, "legacy", 1);
+        UUID active = UUID.randomUUID();
+        insertGrave(active, "active", 1);
+        RetrievalClaimStore.Acquired claim = assertInstanceOf(
+                RetrievalClaimStore.Acquired.class,
+                store.acquire(active, UUID.randomUUID(), "server-a",
+                        RetrievalClaimStore.Operation.INVENTORY_OPEN));
+
+        assertEquals(1, store.backfillAvailableClaims());
+        assertGraveCountAndState(legacy, 1, "AVAILABLE");
+        assertGraveCountAndState(active, 1, "ACTIVE");
+        assertEquals(0, store.backfillAvailableClaims());
+        assertTrue(store.quarantine(claim.claim(), "ambiguous"));
+    }
+
+    @Test
+    void callbackRuntimeFailuresRollbackBeforeConnectionReturn() throws Exception {
+        UUID createId = UUID.randomUUID();
+        assertFalse(store.createAvailable(createId, connection -> {
+            throw new IllegalStateException("boom");
+        }));
+        assertRowCounts(createId, 0, 0);
+
+        UUID mutateId = UUID.randomUUID();
+        insertGrave(mutateId, "items", 1);
+        assertFalse(store.mutateAvailable(mutateId, connection -> {
+            try (var statement = connection.prepareStatement(
+                    "UPDATE graves_grave SET inventory = 'changed' WHERE uuid = ?")) {
+                statement.setString(1, mutateId.toString());
+                statement.executeUpdate();
+            }
+            throw new IllegalStateException("boom");
+        }));
+        assertEquals("items", readInventory(mutateId));
+        assertGraveCountAndState(mutateId, 1, "AVAILABLE");
+    }
+
+    @Test
+    void creationAndMutationCallbacksMustPreserveRequestedPayloadRow() throws Exception {
+        UUID missing = UUID.randomUUID();
+        assertFalse(store.createAvailable(missing, connection -> true));
+        assertRowCounts(missing, 0, 0);
+
+        UUID requested = UUID.randomUUID();
+        UUID wrong = UUID.randomUUID();
+        assertFalse(store.createAvailable(requested, connection -> {
+            try (var statement = connection.prepareStatement(
+                    "INSERT INTO graves_grave (uuid, inventory, experience) VALUES (?, 'wrong', 0)")) {
+                statement.setString(1, wrong.toString());
+                return statement.executeUpdate() == 1;
+            }
+        }));
+        assertRowCounts(requested, 0, 0);
+        assertRowCounts(wrong, 0, 0);
+
+        UUID existing = UUID.randomUUID();
+        insertGrave(existing, "items", 1);
+        assertFalse(store.mutateAvailable(existing, connection -> {
+            try (var statement = connection.prepareStatement(
+                    "DELETE FROM graves_grave WHERE uuid = ?")) {
+                statement.setString(1, existing.toString());
+                statement.executeUpdate();
+                return true;
+            }
+        }));
+        assertRowCounts(existing, 1, 1);
+    }
+
+    private void assertRowCounts(UUID graveId, int graves, int claims) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             var statement = connection.prepareStatement(
+                     "SELECT (SELECT COUNT(*) FROM graves_grave WHERE uuid = ?) AS graves, "
+                             + "(SELECT COUNT(*) FROM graves_grave_claim WHERE grave_uuid = ?) AS claims")) {
+            statement.setString(1, graveId.toString());
+            statement.setString(2, graveId.toString());
+            try (var rows = statement.executeQuery()) {
+                assertTrue(rows.next());
+                assertEquals(graves, rows.getInt("graves"));
+                assertEquals(claims, rows.getInt("claims"));
+            }
+        }
+    }
+
+    private int readIntColumn(UUID graveId, String column) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             var statement = connection.prepareStatement(
+                     "SELECT " + column + " FROM graves_grave WHERE uuid = ?")) {
+            statement.setString(1, graveId.toString());
+            try (var rows = statement.executeQuery()) {
+                assertTrue(rows.next());
+                return rows.getInt(1);
+            }
+        }
+    }
+
+    private String readInventory(UUID graveId) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             var statement = connection.prepareStatement(
+                     "SELECT inventory FROM graves_grave WHERE uuid = ?")) {
+            statement.setString(1, graveId.toString());
+            try (var rows = statement.executeQuery()) {
+                assertTrue(rows.next());
+                return rows.getString(1);
+            }
+        }
+    }
+
+    private void assertGraveCountAndState(UUID graveId, int graves, String state) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             var statement = connection.prepareStatement(
+                     "SELECT (SELECT COUNT(*) FROM graves_grave WHERE uuid = ?) AS graves, "
+                             + "(SELECT state FROM graves_grave_claim WHERE grave_uuid = ?) AS state")) {
+            statement.setString(1, graveId.toString());
+            statement.setString(2, graveId.toString());
+            try (var rows = statement.executeQuery()) {
+                assertTrue(rows.next());
+                assertEquals(graves, rows.getInt("graves"));
+                assertEquals(state, rows.getString("state"));
+            }
+        }
     }
 
     private void insertGrave(UUID graveId, String inventory, int experience) throws Exception {

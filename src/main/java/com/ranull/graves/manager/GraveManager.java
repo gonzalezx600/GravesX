@@ -19,6 +19,7 @@ import dev.cwhead.GravesX.api.provider.RegisterGraveProviders;
 import dev.cwhead.GravesX.event.*;
 import dev.cwhead.GravesX.exception.GravesXGraveProviderException;
 import dev.cwhead.GravesX.exception.GravesXNullPointerException;
+import dev.cwhead.GravesX.persistence.RetrievalClaimStore;
 import me.jay.GravesX.util.pluginsWithoutMavenReposOrUsefulApiDocsThatCauseBugs.ReflectSupportAE;
 import com.ranull.graves.util.StringUtil;
 import org.bukkit.*;
@@ -255,28 +256,12 @@ public class GraveManager {
                                     if (cancelled) {
                                         plugin.debugMessage("Timeout: removing grave " + grave.getUUID(), 2);
 
-                                        dropGraveItems(loc, grave);
-                                        dropGraveExperience(loc, grave);
-                                        sendPlayerMessage(grave, "message.timeout", loc);
-
-                                        synchronized (graveRemoveList) {
-                                            graveRemoveList.add(grave);
-                                        }
-
-                                        removeGrave(grave);
+                                        runClaimedDropAndDelete(grave, loc, RetrievalClaimStore.Operation.TIMEOUT_DROP);
                                     }
                                 } else {
                                     plugin.debugMessage("Timeout: removing grave (drop handled by removeGrave): " + grave.getUUID(), 2);
 
-                                    dropGraveItems(loc, grave);
-                                    dropGraveExperience(loc, grave);
-                                    sendPlayerMessage(grave, "message.timeout", loc);
-
-                                    synchronized (graveRemoveList) {
-                                        graveRemoveList.add(grave);
-                                    }
-
-                                    removeGrave(grave);
+                                    runClaimedDropAndDelete(grave, loc, RetrievalClaimStore.Operation.TIMEOUT_DROP);
                                 }
 
                             } else {
@@ -980,17 +965,16 @@ public class GraveManager {
 
         Location deathLoc = toDel.getLocationDeath();
         if (deathLoc == null || deathLoc.getWorld() == null) {
-            removeGrave(toDel);
+            failClosedLegacyPayloadEffect("remove-oldest-invalid-location", toDel);
             return;
         }
 
-        plugin.getChunkManager().ensureLoadedAndExecute(deathLoc, deathLoc, true, false, () -> {
-            if (plugin.getConfigManager().getConfigSection("drop.timeout", toDel).getBoolean("drop.timeout", true)) {
-                dropGraveItems(deathLoc, toDel);
-                dropGraveExperience(deathLoc, toDel);
-            }
+        if (plugin.getConfigManager().getConfigSection("drop.timeout", toDel).getBoolean("drop.timeout", true)) {
+            plugin.getChunkManager().ensureLoadedAndExecute(deathLoc, deathLoc, true, false,
+                    () -> runClaimedDropAndDelete(toDel, deathLoc, RetrievalClaimStore.Operation.TIMEOUT_DROP));
+        } else {
             removeGrave(toDel);
-        });
+        }
     }
 
     /**
@@ -999,27 +983,7 @@ public class GraveManager {
      * @param grave the grave that should drop items
      */
     public void dropAllFromGrave(Grave grave) {
-        Location loc = grave.getLocationDeath();
-
-        World w = loc.getWorld();
-
-        List<ItemStack> items = grave.getInventoryItemStack();
-        if (items != null) {
-            for (ItemStack is : items) {
-                if (is == null || is.getType() == Material.AIR || is.getAmount() <= 0) continue;
-                w.dropItemNaturally(loc, is.clone());
-            }
-            try { items.clear(); } catch (Throwable ignored) {}
-        }
-
-        Map<EquipmentSlot, ItemStack> equip = grave.getEquipmentMap();
-        if (equip != null) {
-            for (ItemStack is : equip.values()) {
-                if (is == null || is.getType() == Material.AIR || is.getAmount() <= 0) continue;
-                w.dropItemNaturally(loc, is.clone());
-            }
-            try { equip.clear(); } catch (Throwable ignored) {}
-        }
+        failClosedLegacyPayloadEffect("drop-all", grave);
     }
 
     /**
@@ -1028,6 +992,14 @@ public class GraveManager {
      * @param grave the grave to remove.
      */
     public void removeGrave(Grave grave) {
+        removeGrave(grave, false);
+    }
+
+    private void cleanupDeletedGrave(Grave grave) {
+        removeGrave(grave, true);
+    }
+
+    private void removeGrave(Grave grave, boolean persistenceAlreadyDeleted) {
         if (grave == null) return;
 
         plugin.debugMessage("Starting removal of grave: " + grave.getUUID(), 1);
@@ -1139,12 +1111,6 @@ public class GraveManager {
                 } catch (Throwable ignored) {}
 
                 try {
-                    plugin.getDataManager().removeGrave(grave);
-                } catch (Throwable t) {
-                    plugin.getLogger().warning("DataManager removeGrave failed for " + grave.getUUID() + ": " + t.getMessage());
-                }
-
-                try {
                     if (!plugin.getCacheManager().isCacheDisabled()) {
                         plugin.getCacheManager().getGraveMap().remove(grave.getUUID());
                     }
@@ -1162,11 +1128,34 @@ public class GraveManager {
             }
         };
 
-        if (anchor != null && anchor.getWorld() != null) {
-            plugin.getSchedulerManager().execute(anchor, work);
-        } else {
-            plugin.getSchedulerManager().runTask(work);
+        Runnable scheduleCleanup = () -> {
+            try {
+                if (finalAnchor != null && finalAnchor.getWorld() != null) {
+                    plugin.getSchedulerManager().execute(finalAnchor, work);
+                } else {
+                    plugin.getSchedulerManager().runTask(work);
+                }
+            } catch (RuntimeException | Error schedulingFailure) {
+                plugin.getLogger().severe("Guarded deletion committed but grave cleanup could not be scheduled for "
+                        + grave.getUUID() + ": " + schedulingFailure.getMessage());
+                plugin.logStackTrace(schedulingFailure);
+            }
+        };
+
+        if (persistenceAlreadyDeleted) {
+            scheduleCleanup.run();
+            return;
         }
+
+        plugin.getDataManager().deleteGrave(grave.getUUID()).whenComplete((deleted, failure) -> {
+            if (failure != null || !Boolean.TRUE.equals(deleted)) {
+                plugin.getLogger().warning("Grave cleanup refused for " + grave.getUUID()
+                        + " because guarded persistence deletion failed or the grave is not AVAILABLE");
+                if (failure != null) plugin.logStackTrace(failure);
+                return;
+            }
+            scheduleCleanup.run();
+        });
     }
 
     /**
@@ -1997,6 +1986,97 @@ public class GraveManager {
         return counter;
     }
 
+    private void runClaimedDropAndDelete(
+            Grave grave, Location location, RetrievalClaimStore.Operation operation) {
+        if (grave == null || location == null || location.getWorld() == null) return;
+        Location anchor = location.clone();
+        plugin.getDataManager().acquireGrave(grave.getUUID(), grave.getOwnerUUID(), operation)
+                .whenComplete((result, acquisitionFailure) -> {
+                    if (acquisitionFailure != null || !(result instanceof RetrievalClaimStore.Acquired acquired)) {
+                        plugin.getLogger().warning("Refused " + operation + " for grave " + grave.getUUID()
+                                + " because its retrieval claim could not be acquired");
+                        if (acquisitionFailure != null) plugin.logStackTrace(acquisitionFailure);
+                        return;
+                    }
+
+                    RetrievalClaimStore.Claim claim = acquired.claim();
+                    Runnable effect = () -> {
+                        try {
+                            dropClaimedPayload(anchor, grave, acquired.payload());
+                        } catch (Throwable effectFailure) {
+                            plugin.getDataManager().quarantineClaim(claim, "minecraft-effect-failed")
+                                    .whenComplete((ignored, quarantineFailure) -> {
+                                        if (quarantineFailure != null) plugin.logStackTrace(quarantineFailure);
+                                    });
+                            plugin.getLogger().severe("Claimed grave drop failed for " + grave.getUUID()
+                                    + "; claim quarantined: " + effectFailure.getMessage());
+                            plugin.logStackTrace(effectFailure);
+                            return;
+                        }
+
+                        plugin.getDataManager().completeClaimedDeletion(claim)
+                                .whenComplete((deleted, completionFailure) -> {
+                                    if (completionFailure != null || !Boolean.TRUE.equals(deleted)) {
+                                        plugin.getDataManager().quarantineClaim(claim, "ambiguous-delete-completion")
+                                                .whenComplete((ignored, quarantineFailure) -> {
+                                                    if (quarantineFailure != null) plugin.logStackTrace(quarantineFailure);
+                                                });
+                                        plugin.getLogger().severe("Claimed grave effects completed but SQL deletion was ambiguous for "
+                                                + grave.getUUID() + "; claim quarantined");
+                                        if (completionFailure != null) plugin.logStackTrace(completionFailure);
+                                        return;
+                                    }
+                                    cleanupDeletedGrave(grave);
+                                });
+                    };
+
+                    try {
+                        plugin.getSchedulerManager().execute(anchor, effect);
+                    } catch (RuntimeException | Error schedulingFailure) {
+                        plugin.getDataManager().quarantineClaim(claim, "effect-scheduling-failed");
+                        plugin.logStackTrace(schedulingFailure);
+                    }
+                });
+    }
+
+    private void dropClaimedPayload(
+            Location location, Grave grave, RetrievalClaimStore.Payload payload) {
+        World world = location.getWorld();
+        if (world == null) throw new GravesXNullPointerException("World returned null for grave " + grave.getUUID());
+        if (payload == null || payload.inventory() == null) {
+            throw new IllegalStateException("Claimed grave payload is missing for " + grave.getUUID());
+        }
+
+        String title = StringUtil.parseString(
+                plugin.getLanguageManager().get(plugin.getServer().getPlayer(grave.getOwnerUUID()), "message.gui.title"),
+                grave.getLocationDeath(), grave, plugin);
+        Inventory inventory = InventoryUtil.stringToInventory(grave, payload.inventory(), title, plugin);
+        for (ItemStack item : inventory.getContents()) {
+            if (item != null && item.getType() != Material.AIR && item.getAmount() > 0) {
+                world.dropItemNaturally(location, item.clone());
+            }
+        }
+
+        if (payload.equipment() != null) {
+            Map<EquipmentSlot, ItemStack> equipment =
+                    InventoryUtil.stringToEquipmentMap(payload.equipment(), plugin, grave);
+            for (ItemStack item : equipment.values()) {
+                if (item != null && item.getType() != Material.AIR && item.getAmount() > 0) {
+                    world.dropItemNaturally(location, item.clone());
+                }
+            }
+        }
+
+        if (payload.experience() > 0) {
+            ExperienceOrb orb = (ExperienceOrb) world.spawnEntity(location, EntityType.EXPERIENCE_ORB);
+            orb.setExperience(payload.experience());
+        }
+
+        grave.getInventory().clear();
+        if (grave.getEquipmentMap() != null) grave.getEquipmentMap().clear();
+        grave.setExperience(0);
+    }
+
     /**
      * Breaks a grave at its death location.
      *
@@ -2017,27 +2097,11 @@ public class GraveManager {
             return;
         }
         if (location == null || location.getWorld() == null) {
-            removeGrave(grave);
-            plugin.debugMessage("Grave " + grave.getUUID() + " broken (no valid location/world for drops)", 1);
+            failClosedLegacyPayloadEffect("break-invalid-location", grave);
             return;
         }
 
-        Location anchor = location.clone();
-        plugin.getSchedulerManager().execute(anchor, () -> {
-            try {
-                dropGraveItems(anchor, grave);
-                dropGraveExperience(anchor, grave);
-                if (grave.getLocationDeath().getBlock().getType() == Material.valueOf(plugin.getConfigManager().getConfigSection("block.material", grave).getString("block.material", "PLAYER_HEAD"))) {
-                    grave.getLocationDeath().getBlock().setType(Material.valueOf("AIR"));
-                }
-                removeGrave(grave);
-                plugin.debugMessage("Grave " + grave.getUUID() + " broken", 1);
-            } catch (Throwable t) {
-                plugin.debugMessage("Grave " + grave.getUUID() + " failed to break due to an error", 2);
-                plugin.getLogger().severe("Error while dropping items/XP for grave " + grave.getUUID() + ": " + t.getMessage());
-                plugin.logStackTrace(t);
-            }
-        });
+        runClaimedDropAndDelete(grave, location, RetrievalClaimStore.Operation.BREAK_DROP);
     }
 
     /**
@@ -2050,34 +2114,14 @@ public class GraveManager {
      * @param location the location to drop the items.
      * @param grave    the grave containing the items.
      */
+    private void failClosedLegacyPayloadEffect(String operation, Grave grave) {
+        plugin.getLogger().warning("Refused legacy grave payload operation '" + operation + "' for "
+                + (grave == null ? "unknown grave" : grave.getUUID())
+                + " because it has not yet been migrated to token-authorized claims");
+    }
+
     public void dropGraveItems(Location location, Grave grave) {
-        if (grave == null || location == null || location.getWorld() == null) {
-            return;
-        }
-
-        Inventory inv = grave.getInventory();
-
-        Location anchor = location.clone();
-        plugin.getSchedulerManager().execute(anchor, () -> {
-            try {
-                World world = anchor.getWorld();
-                if (world == null) {
-                    return;
-                }
-
-                for (ItemStack itemStack : inv.getContents()) {
-                    if (itemStack != null) {
-                        world.dropItemNaturally(anchor, itemStack);
-                    }
-                }
-
-                inv.clear();
-                plugin.getDataManager().saveGrave(grave);
-            } catch (Throwable t) {
-                plugin.debugMessage("dropGraveItems failed for " + grave.getUUID() + ": " + t.getMessage(), 2);
-                plugin.logStackTrace(t);
-            }
-        });
+        failClosedLegacyPayloadEffect("drop-items", grave);
     }
 
     /**
@@ -2087,38 +2131,7 @@ public class GraveManager {
      * @param grave  the grave containing the experience.
      */
     public void giveGraveExperience(Player player, Grave grave) {
-        if (player == null || grave == null) {
-            return;
-        }
-
-        int xp = grave.getExperience();
-        if (xp <= 0) {
-            return;
-        }
-
-        Location anchor = player.getLocation();
-        if (anchor.getWorld() == null) {
-            plugin.getSchedulerManager().runTask(() -> {
-                if (!player.isOnline()) {
-                    return;
-                }
-                player.giveExp(xp);
-                grave.setExperience(0);
-                plugin.getDataManager().updateGrave(grave, "experience", 0);
-                plugin.getEntityManager().playWorldSound("ENTITY_EXPERIENCE_ORB_PICKUP", player);
-            });
-            return;
-        }
-
-        plugin.getSchedulerManager().execute(anchor, () -> {
-            if (!player.isOnline()) {
-                return;
-            }
-            player.giveExp(xp);
-            grave.setExperience(0);
-            plugin.getDataManager().updateGrave(grave, "experience", 0);
-            plugin.getEntityManager().playWorldSound("ENTITY_EXPERIENCE_ORB_PICKUP", player);
-        });
+        failClosedLegacyPayloadEffect("give-experience", grave);
     }
 
     /**
@@ -2128,34 +2141,7 @@ public class GraveManager {
      * @param grave    the grave containing the experience.
      */
     public void dropGraveExperience(Location location, Grave grave) {
-        if (grave == null || location == null || location.getWorld() == null) {
-            return;
-        }
-
-        int xp = grave.getExperience();
-        if (xp <= 0) {
-            return;
-        }
-
-        Location anchor = location.clone();
-        plugin.getSchedulerManager().execute(anchor, () -> {
-            try {
-                World world = anchor.getWorld();
-                if (world == null) {
-                    throw new GravesXNullPointerException("World returned null for grave " + grave.getUUID());
-                }
-
-                ExperienceOrb experienceOrb = (ExperienceOrb) world.spawnEntity(anchor, EntityType.EXPERIENCE_ORB);
-
-                experienceOrb.setExperience(xp);
-                plugin.debugMessage("Dropping experience for grave " + grave.getUUID() + " in the amount of " + grave.getExperience(), 1);
-                grave.setExperience(0);
-                plugin.getDataManager().updateGrave(grave, "experience", 0);
-            } catch (Throwable t) {
-                plugin.getLogger().severe("Unable to drop grave experience in the total of " + grave.getExperience() + ": " + t.getMessage());
-                plugin.logStackTrace(t);
-            }
-        });
+        failClosedLegacyPayloadEffect("drop-experience", grave);
     }
 
     /**
@@ -2252,7 +2238,15 @@ public class GraveManager {
      * @param preview  whether to open the grave in preview mode (when allowed by config).
      * @return true if the open/auto-loot operation was scheduled, false otherwise.
      */
+    private boolean isClaimedInventoryOpenEnabled() {
+        return false;
+    }
+
     public boolean openGrave(Entity entity, Location location, Grave grave, boolean preview) {
+        if (!isClaimedInventoryOpenEnabled()) {
+            failClosedLegacyPayloadEffect(preview ? "preview-open" : "inventory-open", grave);
+            return false;
+        }
         if (!(entity instanceof Player player)) {
             return false;
         }
@@ -2474,6 +2468,10 @@ public class GraveManager {
      * @param grave    the grave to be looted.
      */
     public void autoLootGrave(Entity entity, Location location, Grave grave) {
+        if (!isClaimedInventoryOpenEnabled()) {
+            failClosedLegacyPayloadEffect("auto-loot", grave);
+            return;
+        }
         if (!(entity instanceof Player player)) {
             return;
         }

@@ -32,7 +32,7 @@ public final class ClaimServerIdentity {
                 while (buffer.hasRemaining()) channel.write(buffer);
                 channel.force(true);
             }
-            forceDirectory(parent);
+            forceDirectoryForPlatform(parent, System.getProperty("os.name", ""));
             return identity;
         } catch (java.nio.file.FileAlreadyExistsException raced) {
             return readExisting(identityFile);
@@ -41,8 +41,8 @@ public final class ClaimServerIdentity {
         }
     }
 
-    private static void forceDirectory(Path directory) throws IOException {
-        if (directory == null) return;
+    static void forceDirectoryForPlatform(Path directory, String osName) throws IOException {
+        if (directory == null || osName.toLowerCase(java.util.Locale.ROOT).contains("windows")) return;
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
             channel.force(true);
         }

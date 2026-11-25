@@ -8,6 +8,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Clock;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -20,8 +21,11 @@ public final class RetrievalClaimStore {
     public enum State { AVAILABLE, ACTIVE, QUARANTINED, DELETED }
 
     public enum Operation {
-        INVENTORY_OPEN, AUTO_LOOT, BREAK_DROP, TIMEOUT_DROP, DELETE
+        INVENTORY_OPEN, AUTO_LOOT, BREAK_DROP, TIMEOUT_DROP, DELETE, ADDON_MUTATION
     }
+
+    private static final Set<String> AVAILABLE_COLUMNS = Set.of(
+            "inventory", "experience", "protection", "provider_id");
 
     public enum Denial { NOT_FOUND, ACTIVE, QUARANTINED, DATABASE_ERROR }
 
@@ -34,12 +38,19 @@ public final class RetrievalClaimStore {
             String serverId,
             Operation operation) {}
 
-    public record Acquired(Claim claim) implements AcquireResult {}
+    public record Payload(String inventory, String equipment, int experience) {}
+
+    public record Acquired(Claim claim, Payload payload) implements AcquireResult {}
 
     public record Denied(
             Denial reason,
             String ownerServer,
             UUID ownerPlayer) implements AcquireResult {}
+
+    @FunctionalInterface
+    public interface AvailableMutation {
+        boolean apply(Connection connection) throws SQLException;
+    }
 
     private final DataSource dataSource;
     private final String graveTable;
@@ -84,6 +95,65 @@ public final class RetrievalClaimStore {
         }
     }
 
+    public int backfillAvailableClaims() throws SQLException {
+        java.util.List<UUID> missing = new java.util.ArrayList<>();
+        String select = "SELECT g.uuid FROM " + graveTable + " g "
+                + "WHERE NOT EXISTS (SELECT 1 FROM " + claimTable + " c WHERE c.grave_uuid = g.uuid)";
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement statement = connection.prepareStatement(select);
+             ResultSet rows = statement.executeQuery()) {
+            while (rows.next()) missing.add(UUID.fromString(rows.getString(1)));
+        }
+
+        int ensured = 0;
+        long now = clock.millis();
+        for (UUID graveUuid : missing) {
+            if (ensureClaimRow(graveUuid, now)) ensured++;
+        }
+        return ensured;
+    }
+
+    public boolean createAvailable(UUID graveUuid, AvailableMutation insertPayload) {
+        Objects.requireNonNull(graveUuid, "graveUuid");
+        Objects.requireNonNull(insertPayload, "insertPayload");
+        long now = clock.millis();
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "INSERT INTO " + claimTable
+                                + " (grave_uuid, state, updated_at) VALUES (?, 'AVAILABLE', ?)")) {
+                    statement.setString(1, graveUuid.toString());
+                    statement.setLong(2, now);
+                    if (statement.executeUpdate() != 1) {
+                        connection.rollback();
+                        return false;
+                    }
+                }
+                if (!insertPayload.apply(connection) || !graveExists(connection, graveUuid)) {
+                    connection.rollback();
+                    return false;
+                }
+                connection.commit();
+                return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
+            } catch (SQLException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } finally {
+                restoreAutoCommitQuietly(connection);
+            }
+        } catch (SQLException failure) {
+            return false;
+        }
+    }
+
     public AcquireResult acquire(
             UUID graveUuid,
             UUID claimantUuid,
@@ -112,7 +182,8 @@ public final class RetrievalClaimStore {
                             : new Denied(Denial.DATABASE_ERROR, null, null);
                 }
 
-                if (!graveExists(connection, graveUuid)) {
+                Payload payload = readPayload(connection, graveUuid);
+                if (payload == null) {
                     if (markDeleted(connection, claim, now) != 1) {
                         connection.rollback();
                         return new Denied(Denial.DATABASE_ERROR, null, null);
@@ -122,7 +193,7 @@ public final class RetrievalClaimStore {
                 }
 
                 connection.commit();
-                return new Acquired(claim);
+                return new Acquired(claim, payload);
             } catch (SQLException failure) {
                 rollbackQuietly(connection);
                 return new Denied(Denial.DATABASE_ERROR, null, null);
@@ -131,6 +202,170 @@ public final class RetrievalClaimStore {
             }
         } catch (SQLException failure) {
             return new Denied(Denial.DATABASE_ERROR, null, null);
+        }
+    }
+
+    public boolean updateAvailableInventory(UUID graveUuid, String serializedInventory, int experience) {
+        Objects.requireNonNull(graveUuid, "graveUuid");
+        Objects.requireNonNull(serializedInventory, "serializedInventory");
+        long now = clock.millis();
+        if (!ensureClaimRow(graveUuid, now)) return false;
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                if (lockAvailable(connection, graveUuid, now) != 1) {
+                    connection.rollback();
+                    return false;
+                }
+                int changed;
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "UPDATE " + graveTable + " SET inventory = ?, experience = ? WHERE uuid = ?")) {
+                    statement.setString(1, serializedInventory);
+                    statement.setInt(2, experience);
+                    statement.setString(3, graveUuid.toString());
+                    changed = statement.executeUpdate();
+                }
+                if (changed != 1) {
+                    markAvailableDeleted(connection, graveUuid, now);
+                    connection.commit();
+                    return false;
+                }
+                connection.commit();
+                return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
+            } catch (SQLException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } finally {
+                restoreAutoCommitQuietly(connection);
+            }
+        } catch (SQLException failure) {
+            return false;
+        }
+    }
+
+    public boolean mutateAvailable(UUID graveUuid, AvailableMutation mutation) {
+        Objects.requireNonNull(graveUuid, "graveUuid");
+        Objects.requireNonNull(mutation, "mutation");
+        long now = clock.millis();
+        if (!ensureClaimRow(graveUuid, now)) return false;
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                if (lockAvailable(connection, graveUuid, now) != 1) {
+                    connection.rollback();
+                    return false;
+                }
+                if (!mutation.apply(connection) || !graveExists(connection, graveUuid)) {
+                    connection.rollback();
+                    return false;
+                }
+                connection.commit();
+                return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
+            } catch (SQLException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } finally {
+                restoreAutoCommitQuietly(connection);
+            }
+        } catch (SQLException failure) {
+            return false;
+        }
+    }
+
+    public boolean updateAvailableColumn(UUID graveUuid, String column, Object value) {
+        Objects.requireNonNull(graveUuid, "graveUuid");
+        if (!AVAILABLE_COLUMNS.contains(column)) {
+            throw new IllegalArgumentException("Unsupported grave column: " + column);
+        }
+        long now = clock.millis();
+        if (!ensureClaimRow(graveUuid, now)) return false;
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                if (lockAvailable(connection, graveUuid, now) != 1) {
+                    connection.rollback();
+                    return false;
+                }
+                int changed;
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "UPDATE " + graveTable + " SET " + column + " = ? WHERE uuid = ?")) {
+                    statement.setObject(1, value);
+                    statement.setString(2, graveUuid.toString());
+                    changed = statement.executeUpdate();
+                }
+                if (changed != 1) {
+                    markAvailableDeleted(connection, graveUuid, now);
+                    connection.commit();
+                    return false;
+                }
+                connection.commit();
+                return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
+            } catch (SQLException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } finally {
+                restoreAutoCommitQuietly(connection);
+            }
+        } catch (SQLException failure) {
+            return false;
+        }
+    }
+
+    public boolean deleteAvailable(UUID graveUuid) {
+        Objects.requireNonNull(graveUuid, "graveUuid");
+        long now = clock.millis();
+        if (!ensureClaimRow(graveUuid, now)) return false;
+
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                if (markAvailableDeleted(connection, graveUuid, now) != 1) {
+                    connection.rollback();
+                    return false;
+                }
+                int deleted;
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "DELETE FROM " + graveTable + " WHERE uuid = ?")) {
+                    statement.setString(1, graveUuid.toString());
+                    deleted = statement.executeUpdate();
+                }
+                connection.commit();
+                return deleted == 1;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
+            } catch (SQLException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } finally {
+                restoreAutoCommitQuietly(connection);
+            }
+        } catch (SQLException failure) {
+            return false;
         }
     }
 
@@ -174,6 +409,12 @@ public final class RetrievalClaimStore {
                 }
                 connection.commit();
                 return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
             } catch (SQLException failure) {
                 rollbackQuietly(connection);
                 return false;
@@ -216,6 +457,12 @@ public final class RetrievalClaimStore {
                 }
                 connection.commit();
                 return true;
+            } catch (RuntimeException failure) {
+                rollbackQuietly(connection);
+                return false;
+            } catch (Error failure) {
+                rollbackQuietly(connection);
+                throw failure;
             } catch (SQLException failure) {
                 rollbackQuietly(connection);
                 return false;
@@ -290,6 +537,18 @@ public final class RetrievalClaimStore {
         }
     }
 
+    private Payload readPayload(Connection connection, UUID graveUuid) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT inventory, equipment, experience FROM " + graveTable + " WHERE uuid = ?")) {
+            statement.setString(1, graveUuid.toString());
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) return null;
+                return new Payload(rows.getString("inventory"), rows.getString("equipment"),
+                        rows.getInt("experience"));
+            }
+        }
+    }
+
     private boolean graveExists(Connection connection, UUID graveUuid) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT 1 FROM " + graveTable + " WHERE uuid = ?")) {
@@ -297,6 +556,28 @@ public final class RetrievalClaimStore {
             try (ResultSet rows = statement.executeQuery()) {
                 return rows.next();
             }
+        }
+    }
+
+    private int lockAvailable(Connection connection, UUID graveUuid, long now) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "UPDATE " + claimTable + " SET updated_at = ? "
+                        + "WHERE grave_uuid = ? AND state = 'AVAILABLE'")) {
+            statement.setLong(1, now);
+            statement.setString(2, graveUuid.toString());
+            return statement.executeUpdate();
+        }
+    }
+
+    private int markAvailableDeleted(Connection connection, UUID graveUuid, long now) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "UPDATE " + claimTable
+                        + " SET state = 'DELETED', claim_token = NULL, claimant_uuid = NULL, "
+                        + "server_id = NULL, operation = NULL, claimed_at = NULL, updated_at = ?, reason = NULL "
+                        + "WHERE grave_uuid = ? AND state = 'AVAILABLE'")) {
+            statement.setLong(1, now);
+            statement.setString(2, graveUuid.toString());
+            return statement.executeUpdate();
         }
     }
 

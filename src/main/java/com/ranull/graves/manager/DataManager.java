@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import dev.cwhead.GravesX.manager.db.PendingLoad;
 
 import static com.ranull.graves.manager.DataManager.Type.*;
@@ -142,16 +143,37 @@ public class DataManager {
 
         int queued = pendingWrites.incrementAndGet();
         plugin.databaseDebug("Queued async database write (pending writes: " + queued + ").", 1);
-        plugin.getSchedulerManager().runTaskAsynchronously(() -> {
-            try {
-                task.run();
-            } catch (RuntimeException | Error e) {
-                plugin.databaseDebug("Async database write threw an unexpected error: " + e, 2);
-                throw e;
-            } finally {
-                pendingWrites.decrementAndGet();
-            }
-        });
+        try {
+            plugin.getSchedulerManager().runTaskAsynchronously(() -> {
+                try {
+                    task.run();
+                } catch (RuntimeException | Error e) {
+                    plugin.databaseDebug("Async database write threw an unexpected error: " + e, 2);
+                    throw e;
+                } finally {
+                    pendingWrites.decrementAndGet();
+                }
+            });
+        } catch (RuntimeException | Error submissionFailure) {
+            pendingWrites.decrementAndGet();
+            throw submissionFailure;
+        }
+    }
+
+    private <T> CompletionStage<T> runAsyncDatabaseResult(Supplier<T> task) {
+        CompletableFuture<T> completion = new CompletableFuture<>();
+        try {
+            runAsyncDatabaseTask(() -> {
+                try {
+                    completion.complete(task.get());
+                } catch (Throwable failure) {
+                    completion.completeExceptionally(failure);
+                }
+            });
+        } catch (RuntimeException | Error submissionFailure) {
+            completion.completeExceptionally(submissionFailure);
+        }
+        return completion;
     }
 
     /**
@@ -493,6 +515,10 @@ public class DataManager {
         plugin.databaseDebug("Setting up database tables (grave, block, hologram, entity).", 1);
         setupGraveTable();
         retrievalClaimStore.createTable();
+        int backfilledClaims = retrievalClaimStore.backfillAvailableClaims();
+        if (backfilledClaims > 0) {
+            plugin.getLogger().info("Created guarded claim rows for " + backfilledClaims + " existing grave(s).");
+        }
         int quarantined = retrievalClaimStore.quarantineActiveFromServer(
                 claimServerId, "unclean-restart-or-reload");
         if (quarantined > 0) {
@@ -2588,13 +2614,17 @@ public class DataManager {
         Object[] parameters = graveParameters(grave);
 
         plugin.databaseDebug("Adding grave " + grave.getUUID() + " to the database.", 1);
-        try {
-            executeUpdate(query, parameters, true);
-            plugin.databaseDebug("Grave " + grave.getUUID() + " added to the database.", 1);
-        } catch (SQLException ex) {
-            plugin.databaseDebug("Failed to add grave " + grave.getUUID() + ": " + ex.getMessage(), 2);
-            throw new CacheCodec.CacheException("Failed to create grave", ex);
+        boolean created = retrievalClaimStore.createAvailable(grave.getUUID(), connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(query)) {
+                bindStatementParameters(statement, parameters);
+                return statement.executeUpdate() == 1;
+            }
+        });
+        if (!created) {
+            throw new CacheCodec.CacheException("Failed to create grave and guarded claim row",
+                    new IllegalStateException("claim or payload insert was rejected"));
         }
+        plugin.databaseDebug("Grave " + grave.getUUID() + " added to the database.", 1);
         if (!isCacheDisabled()) {
             if (deathLoc != null && deathLoc.getWorld() != null) {
                 Location finalDeathLoc = deathLoc;
@@ -2603,6 +2633,19 @@ public class DataManager {
                 );
             } else {
                 plugin.getCacheManager().getGraveMap().put(grave.getUUID(), grave);
+            }
+        }
+    }
+
+    private void bindStatementParameters(PreparedStatement statement, Object[] parameters) throws SQLException {
+        for (int index = 0; index < parameters.length; index++) {
+            Object value = parameters[index];
+            if (value instanceof UUID uuid) {
+                statement.setString(index + 1, uuid.toString());
+            } else if (value instanceof EntityType entityType) {
+                statement.setString(index + 1, entityType.name());
+            } else {
+                statement.setObject(index + 1, value);
             }
         }
     }
@@ -2675,23 +2718,19 @@ public class DataManager {
         Object[] parameters = new Object[insert.length];
         System.arraycopy(insert, 1, parameters, 0, insert.length - 1);
         parameters[parameters.length - 1] = insert[0];
-        try {
-            int changed = executeUpdate("UPDATE " + getStoragePrefix() + "grave SET "+
-                    "owner_type = ?, owner_name = ?, owner_name_display = ?, owner_uuid = ?, owner_texture = ?, owner_texture_signature = ?, killer_type = ?, killer_name = ?, killer_name_display = ?, killer_uuid = ?, location_death = ?, yaw = ?, pitch = ?, inventory = ?, equipment = ?, experience = ?, protection = ?, is_abandoned = ?, time_alive = ?, time_protection = ?, time_creation = ?, permissions = ?, provider_id = ?, death_reason = ? WHERE uuid = ?", parameters, true);
-            return changed > 0 || graveRowExists(grave.getUUID());
-        } catch (SQLException ex) {
-            plugin.databaseDebug("Failed saving grave " + grave.getUUID() + " to the persistent database: " + ex.getMessage(), 2);
-            throw new CacheCodec.CacheException("Failed saving grave to persistent database", ex);
+        String sql = "UPDATE " + getStoragePrefix() + "grave SET "+
+                "owner_type = ?, owner_name = ?, owner_name_display = ?, owner_uuid = ?, owner_texture = ?, owner_texture_signature = ?, killer_type = ?, killer_name = ?, killer_name_display = ?, killer_uuid = ?, location_death = ?, yaw = ?, pitch = ?, inventory = ?, equipment = ?, experience = ?, protection = ?, is_abandoned = ?, time_alive = ?, time_protection = ?, time_creation = ?, permissions = ?, provider_id = ?, death_reason = ? WHERE uuid = ?";
+        boolean saved = retrievalClaimStore.mutateAvailable(grave.getUUID(), connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                bindStatementParameters(statement, parameters);
+                return statement.executeUpdate() == 1;
+            }
+        });
+        if (!saved) {
+            plugin.databaseDebug("Refused full grave save for " + grave.getUUID()
+                    + " because the row is claimed, quarantined, deleted, or missing.", 2);
         }
-    }
-
-    private boolean graveRowExists(UUID uuid) throws SQLException {
-        try (Connection connection = getConnection();
-             PreparedStatement statement = connection.prepareStatement(
-                     "SELECT 1 FROM " + getStoragePrefix() + "grave WHERE uuid = ?")) {
-            statement.setString(1, uuid.toString());
-            try (ResultSet rows = statement.executeQuery()) { return rows.next(); }
-        }
+        return saved;
     }
 
     /**
@@ -2703,36 +2742,55 @@ public class DataManager {
         removeGrave(grave.getUUID());
     }
 
-    public void removeGrave(UUID uuid) {
-        plugin.databaseDebug("Removing grave " + uuid + " from cache and database.", 1);
-        Grave grave = isCacheDisabled() ? plugin.getCacheManager().getGrave(uuid)
-                : plugin.getCacheManager().getGraveMap().remove(uuid);
+    /**
+     * Authorizes and commits only the persistent grave deletion. Callers must
+     * wait for a successful result before removing any cache or world state.
+     */
+    public CompletionStage<RetrievalClaimStore.AcquireResult> acquireGrave(
+            UUID graveUuid, UUID claimantUuid, RetrievalClaimStore.Operation operation) {
+        return runAsyncDatabaseResult(() -> retrievalClaimStore.acquire(
+                graveUuid, claimantUuid, claimServerId, operation));
+    }
 
-        if (grave != null) {
-            Location deathLoc = grave.getLocationDeath();
-            if (deathLoc != null && deathLoc.getWorld() != null) {
-                plugin.getSchedulerManager().execute(deathLoc, () -> {
-                    plugin.getHologramManager().removeHologram(grave);
-                });
-            } else {
-                plugin.getHologramManager().removeHologram(grave);
+    public CompletionStage<Boolean> completeClaimedDeletion(RetrievalClaimStore.Claim claim) {
+        return runAsyncDatabaseResult(() -> retrievalClaimStore.completeDeletion(claim));
+    }
+
+    public CompletionStage<Boolean> quarantineClaim(
+            RetrievalClaimStore.Claim claim, String reason) {
+        return runAsyncDatabaseResult(() -> retrievalClaimStore.quarantine(claim, reason));
+    }
+
+    public CompletionStage<Boolean> deleteGrave(UUID uuid) {
+        plugin.databaseDebug("Requesting guarded grave deletion for " + uuid + ".", 1);
+        return runAsyncDatabaseResult(() -> retrievalClaimStore.deleteAvailable(uuid));
+    }
+
+    public void removeGrave(UUID uuid) {
+        Grave grave = plugin.getCacheManager().getGrave(uuid);
+        deleteGrave(uuid).whenComplete((deleted, failure) -> {
+            if (failure != null || !Boolean.TRUE.equals(deleted)) {
+                plugin.getLogger().warning("Refused grave deletion for " + uuid
+                        + " because it failed or the grave is claimed, quarantined, already deleted, or missing");
+                if (failure != null) plugin.logStackTrace(failure);
+                return;
             }
 
-            removeHologramData(grave);
-        }
-
-        String deleteQuery = "DELETE FROM " + getStoragePrefix() + "grave WHERE uuid = ?";
-        Object[] deleteParams = new Object[] { uuid };
-
-        runAsyncDatabaseTask(() -> {
-            try {
-                plugin.databaseDebug("Attempting to remove grave for UUID: " + uuid, 1);
-                executeUpdate(deleteQuery, deleteParams);
-                plugin.databaseDebug("Grave successfully removed for UUID: " + uuid, 1);
-            } catch (SQLException e) {
-                plugin.databaseDebug("Failed to remove grave: " + e.getMessage(), 2);
-                plugin.getLogger().severe("Failed to remove grave");
-                plugin.logStackTrace(e);
+            Runnable cleanup = () -> {
+                if (!isCacheDisabled()) {
+                    plugin.getCacheManager().getGraveMap().remove(uuid);
+                }
+                if (grave != null) {
+                    plugin.getHologramManager().removeHologram(grave);
+                    removeHologramData(grave);
+                }
+                plugin.databaseDebug("Guarded grave removal completed for UUID: " + uuid, 1);
+            };
+            Location deathLoc = grave == null ? null : grave.getLocationDeath();
+            if (deathLoc != null && deathLoc.getWorld() != null) {
+                plugin.getSchedulerManager().execute(deathLoc, cleanup);
+            } else {
+                plugin.getSchedulerManager().runTask(cleanup);
             }
         });
     }
@@ -2746,17 +2804,12 @@ public class DataManager {
      */
     public void updateGrave(Grave grave, String column, int integer) {
         plugin.databaseDebug("Updating grave " + grave.getUUID() + " column '" + column + "' to " + integer + ".", 1);
-        plugin.getCacheManager().saveGrave(grave);
-        String query = "UPDATE " + getStoragePrefix() + "grave SET " + column + " = ? WHERE uuid = ?";
-        Object[] parameters = new Object[] { integer, grave.getUUID() };
+        plugin.getCacheManager().saveGraveCacheOnly(grave);
 
         runAsyncDatabaseTask(() -> {
-            try {
-                executeUpdate(query, parameters);
-            } catch (SQLException e) {
-                plugin.databaseDebug("Failed to update grave: " + e.getMessage(), 2);
-                plugin.getLogger().severe("Failed to update grave");
-                plugin.logStackTrace(e);
+            if (!retrievalClaimStore.updateAvailableColumn(grave.getUUID(), column, integer)) {
+                plugin.getLogger().warning("Refused grave update for " + grave.getUUID()
+                        + " column '" + column + "' because the grave is claimed, quarantined, deleted, or missing");
             }
         });
     }
@@ -2770,17 +2823,12 @@ public class DataManager {
      */
     public void updateGrave(Grave grave, String column, String string) {
         plugin.databaseDebug("Updating grave " + grave.getUUID() + " column '" + column + "'.", 1);
-        plugin.getCacheManager().saveGrave(grave);
-        String query = "UPDATE " + getStoragePrefix() + "grave SET " + column + " = ? WHERE uuid = ?";
-        Object[] parameters = new Object[] { string, grave.getUUID() };
+        plugin.getCacheManager().saveGraveCacheOnly(grave);
 
         runAsyncDatabaseTask(() -> {
-            try {
-                executeUpdate(query, parameters);
-            } catch (SQLException e) {
-                plugin.databaseDebug("Failed to update grave: " + e.getMessage(), 2);
-                plugin.getLogger().severe("Failed to update grave");
-                plugin.logStackTrace(e);
+            if (!retrievalClaimStore.updateAvailableColumn(grave.getUUID(), column, string)) {
+                plugin.getLogger().warning("Refused grave update for " + grave.getUUID()
+                        + " column '" + column + "' because the grave is claimed, quarantined, deleted, or missing");
             }
         });
     }
@@ -2795,16 +2843,10 @@ public class DataManager {
     @ApiStatus.Experimental
     public void updateGraveMainThread(Grave grave, String column, String string) {
         plugin.databaseDebug("Updating grave " + grave.getUUID() + " column '" + column + "' on the main thread.", 1);
-        plugin.getCacheManager().saveGrave(grave);
-        String query = "UPDATE " + getStoragePrefix() + "grave SET " + column + " = ? WHERE uuid = ?";
-        Object[] parameters = new Object[] { string, grave.getUUID() };
-
-        try {
-            executeUpdateMainThread(query, parameters);
-        } catch (SQLException e) {
-            plugin.databaseDebug("Failed to update grave over main thread: " + e.getMessage(), 2);
-            plugin.getLogger().severe("Failed to update grave over main thread");
-            plugin.logStackTrace(e);
+        plugin.getCacheManager().saveGraveCacheOnly(grave);
+        if (!retrievalClaimStore.updateAvailableColumn(grave.getUUID(), column, string)) {
+            plugin.getLogger().warning("Refused main-thread grave update for " + grave.getUUID()
+                    + " column '" + column + "' because the grave is claimed, quarantined, deleted, or missing");
         }
     }
 
