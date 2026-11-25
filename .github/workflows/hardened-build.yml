@@ -1,0 +1,50 @@
+name: Hardened build
+
+on:
+  push:
+    branches:
+      - fork
+      - 'harden/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Verify and install pinned local build inputs
+        run: bash scripts/bootstrap-local-dependencies.sh
+
+      - name: Test and package
+        run: mvn -B -ntp clean verify
+
+      - name: Validate plugin artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact='target/GravesX-2026.4.9.3-self.jar'
+          test -s "$artifact"
+          jar tf "$artifact" | grep -qx 'plugin.yml'
+          jar tf "$artifact" | grep -q '^com/ranull/graves/bundledlibraries/libby/'
+          if jar tf "$artifact" | grep -Eq '^(com/mojang/authlib|dev/sergiferry/playernpc|com/mira/furnitureengine)/'; then
+            echo 'Provided integration classes were unexpectedly bundled' >&2
+            exit 1
+          fi
+          sha256sum target/GravesX-2026.4.9.3-self*.jar > target/SHA256SUMS
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: GravesX-hardened-${{ github.sha }}
+          path: |
+            target/GravesX-2026.4.9.3-self*.jar
+            target/SHA256SUMS

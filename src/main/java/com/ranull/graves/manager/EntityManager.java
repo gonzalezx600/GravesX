@@ -89,7 +89,8 @@ public class EntityManager extends EntityDataManager {
                 new com.ranull.graves.event.GraveCompassAddEvent(player, grave);
         plugin.getServer().getPluginManager().callEvent(legacy);
 
-        if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+        if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
             // TODO(2027.4.9.1): Remove the pre-1.20 capability fallback; keep modern API behavior.
             if (!plugin.getVersionManager().hasPersistentData()) {
                 return null;
@@ -705,7 +706,8 @@ public class EntityManager extends EntityDataManager {
                 com.ranull.graves.event.GraveProtectionCreateEvent legacy = new com.ranull.graves.event.GraveProtectionCreateEvent(entity, grave);
                 plugin.getServer().getPluginManager().callEvent(legacy);
 
-                if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                     if (grave.getTimeProtectionRemaining() > 0 || grave.getTimeProtectionRemaining() < 0) {
                         plugin.getGraveManager().toggleGraveProtection(grave);
                         playPlayerSound("sound.protection-change", entity, grave);
@@ -721,7 +723,8 @@ public class EntityManager extends EntityDataManager {
                 com.ranull.graves.event.GraveAbandonedEvent legacy = new com.ranull.graves.event.GraveAbandonedEvent(grave);
                 plugin.getServer().getPluginManager().callEvent(legacy);
 
-                if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                     Location location = plugin.getGraveManager().getGraveLocation(entity.getLocation(), grave);
                     if (location != null) {
                         playPlayerSound("sound.abandoned", entity, grave);
@@ -742,7 +745,8 @@ public class EntityManager extends EntityDataManager {
                         new com.ranull.graves.event.GraveCompassUseEvent(player, grave);
                 plugin.getServer().getPluginManager().callEvent(legacy);
 
-                if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                     Location location = plugin.getGraveManager().getGraveLocation(entity.getLocation(), grave);
                     if (location != null) {
                         if (entity.getWorld().equals(location.getWorld())) {
@@ -834,7 +838,8 @@ public class EntityManager extends EntityDataManager {
                         new com.ranull.graves.event.GraveAutoLootEvent(entity, loc, grave);
                 plugin.getServer().getPluginManager().callEvent(legacy);
 
-                if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                     plugin.getGraveManager().autoLootGrave(entity, loc, grave);
 
                     if (plugin.getIntegrationManager().hasNoteBlockAPI()) {
@@ -861,7 +866,8 @@ public class EntityManager extends EntityDataManager {
                             new com.ranull.graves.event.GraveParticleEvent(player, grave);
                     plugin.getServer().getPluginManager().callEvent(legacy);
 
-                    if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                    if (EventDecision.mayProceed(
+                        modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                         Location location = plugin.getGraveManager().getGraveLocation(entity.getLocation(), grave);
 
                         if (location != null && entity.getLocation().getWorld() == grave.getLocationDeath().getWorld()) {

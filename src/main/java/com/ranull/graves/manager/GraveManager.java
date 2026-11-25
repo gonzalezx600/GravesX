@@ -2302,7 +2302,8 @@ public class GraveManager {
                                 new com.ranull.graves.event.GraveAutoLootEvent(player, location, grave);
                         plugin.getServer().getPluginManager().callEvent(legacy);
 
-                        if (!modern.isCancelled() || !modern.isAddon() || !legacy.isCancelled() || !legacy.isAddon()) {
+                        if (EventDecision.mayProceed(
+                                modern.isCancelled(), modern.isAddon(), legacy.isCancelled(), legacy.isAddon())) {
                             autoLootGrave(player, location, grave);
 
                             if (plugin.getIntegrationManager().hasNoteBlockAPI()) {
