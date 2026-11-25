@@ -12,6 +12,8 @@ import dev.cwhead.GravesX.api.provider.RegisterGraveProviders;
 import dev.cwhead.GravesX.cache.CacheCodec;
 import dev.cwhead.GravesX.manager.db.CredentialsProviderFactory;
 import dev.cwhead.GravesX.manager.db.migration.DatabaseMigrator;
+import dev.cwhead.GravesX.persistence.ClaimServerIdentity;
+import dev.cwhead.GravesX.persistence.RetrievalClaimStore;
 import org.apache.commons.lang3.StringUtils;
 import org.bukkit.Location;
 import org.bukkit.Bukkit;
@@ -63,6 +65,8 @@ public class DataManager {
      * </p>
      */
     private HikariDataSource dataSource;
+    private RetrievalClaimStore retrievalClaimStore;
+    private String claimServerId;
 
     private volatile Set<String> customProviderSanitizedIds = Set.of();
     private volatile List<String> customProviderKeysSnapshot = List.of();
@@ -80,6 +84,10 @@ public class DataManager {
     private volatile boolean storageReady;
 
     public boolean isStorageReady() { return storageReady; }
+
+    public RetrievalClaimStore getRetrievalClaimStore() { return retrievalClaimStore; }
+
+    public String getClaimServerId() { return claimServerId; }
 
     /**
      * DATABASE is the cache-disabled mode; no temporary database cache is used.
@@ -484,6 +492,13 @@ public class DataManager {
     private void loadTables() throws SQLException {
         plugin.databaseDebug("Setting up database tables (grave, block, hologram, entity).", 1);
         setupGraveTable();
+        retrievalClaimStore.createTable();
+        int quarantined = retrievalClaimStore.quarantineActiveFromServer(
+                claimServerId, "unclean-restart-or-reload");
+        if (quarantined > 0) {
+            plugin.getLogger().warning("Quarantined " + quarantined
+                    + " ambiguous grave retrieval claim(s) from this server's previous runtime.");
+        }
         setupBlockTable();
         setupHologramTable();
         setupEntityTables();
@@ -603,7 +618,10 @@ public class DataManager {
             config.setCredentialsProvider(provider);
         }
 
+        claimServerId = ClaimServerIdentity.loadOrCreate(
+                plugin.getDataFolder().toPath().resolve("claim-server-id"));
         dataSource = new HikariDataSource(config);
+        retrievalClaimStore = new RetrievalClaimStore(dataSource, getStoragePrefix());
         plugin.databaseDebug("Connection pool created for " + type + ".", 1);
         checkAndUnlockDatabase();
         if (type == MYSQL) checkMariaDBasMySQL();
